@@ -1,0 +1,623 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import librosa
+import streamlit as st
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVC
+
+
+# ==========================================
+# 1. SİNYAL İŞLEME VE ÖZNİTELİK ÇIKARIMI
+# ==========================================
+
+def calculate_ste(frame):
+    return np.sum(frame ** 2)
+
+
+def calculate_zcr(frame):
+    return np.sum(np.abs(np.diff(np.sign(frame)))) / (2 * len(frame))
+
+
+def compute_autocorrelation_pitch(frame, sr, fmin=70, fmax=400):
+    autocorr = np.correlate(frame, frame, mode='full')
+    autocorr = autocorr[len(autocorr) // 2:]
+
+    min_lag = int(sr / fmax)
+    max_lag = int(sr / fmin)
+    search_range = autocorr[min_lag:max_lag]
+
+    if len(search_range) == 0: return 0.0
+    peak_idx = np.argmax(search_range)
+    true_lag = min_lag + peak_idx
+    return sr / true_lag
+
+
+def extract_features(audio_path):
+    if not os.path.exists(audio_path):
+        return None, "Dosya yolda bulunamadı"
+
+    try:
+        audio, sr = librosa.load(audio_path, sr=None)
+    except Exception:
+        return None, "Librosa dosyayı okuyamadı (Bozuk .wav)"
+
+    # Sessizlik kırpma: baş/son gürültülü bölgeleri at
+    audio, _ = librosa.effects.trim(audio, top_db=20)
+    if len(audio) == 0:
+        return None, "Kırpma sonrası ses sinyali boş kaldı"
+
+    frame_length_ms = 30
+    frame_length = int(sr * (frame_length_ms / 1000.0))
+    hop_length = int(frame_length / 2)
+    frames = librosa.util.frame(audio, frame_length=frame_length, hop_length=hop_length).T
+
+    energies = np.array([calculate_ste(f) for f in frames])
+    zcrs = np.array([calculate_zcr(f) for f in frames])
+
+    # Filtreleri biraz daha esnettik (Daha çok ses yakalasın diye)
+    energy_threshold = np.mean(energies) * 0.2
+    zcr_threshold = np.mean(zcrs) * 2.5
+
+    f0_values = []
+    voiced_frames = []
+
+    for i in range(len(frames)):
+        if energies[i] > energy_threshold and zcrs[i] < zcr_threshold:
+            f0 = compute_autocorrelation_pitch(frames[i], sr)
+            if 70 <= f0 <= 400:
+                f0_values.append(f0)
+                voiced_frames.append(frames[i])
+
+    # EĞER HİÇ VOICED BULAMADIYSA: En yüksek enerjili 5 kısmı zorla al (Fallback)
+    if not f0_values:
+        top_frames_idx = np.argsort(energies)[-5:]
+        for idx in top_frames_idx:
+            f0 = compute_autocorrelation_pitch(frames[idx], sr)
+            if 70 <= f0 <= 400:
+                f0_values.append(f0)
+                voiced_frames.append(frames[idx])
+
+    if not f0_values:
+        return None, "Sinyalde hiç insan sesi frekansı (70-400Hz) tespit edilemedi"
+
+    features = {
+        'Ortalama_F0': np.mean(f0_values),
+        'Ortalama_ZCR': np.mean(zcrs),
+        'Enerji_Ortalamasi': np.mean(energies)
+    }
+
+    # Faz 2+: MFCC + Delta + Delta-Delta (her biri ortalama ve std → 78 öznitelik)
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+    delta_mfcc = librosa.feature.delta(mfcc)
+    delta2_mfcc = librosa.feature.delta(mfcc, order=2)
+
+    for matrix, prefix in (
+        (mfcc, 'MFCC'),
+        (delta_mfcc, 'Delta_MFCC'),
+        (delta2_mfcc, 'Delta2_MFCC'),
+    ):
+        for i in range(13):
+            coef = matrix[i]
+            features[f'{prefix}_{i + 1}_mean'] = float(np.mean(coef))
+            features[f'{prefix}_{i + 1}_std'] = float(np.std(coef))
+
+    return (features, voiced_frames, sr), "OK"
+
+
+# ==========================================
+# 2. KURAL TABANLI SINIFLANDIRICI (RULE-BASED)
+# ==========================================
+
+def classify_gender(f0_value):
+    if pd.isna(f0_value) or f0_value == 0: return "Bilinmiyor"
+
+    # Eşik (Threshold) değerleri güncellendi
+    if 85 <= f0_value <= 175:
+        return "Erkek"
+    elif 175 < f0_value <= 280:  # Eskiden 245'ti, 280'e çektik ki kadınlar çocuk sanılmasın
+        return "Kadın"
+    elif f0_value > 280:
+        return "Çocuk"
+    else:
+        return "Erkek"
+
+
+# ==========================================
+# 3. AKILLI VERİ OKUMA VE BİRLEŞTİRME
+# ==========================================
+
+def process_entire_dataset(dataset_path="Dataset/"):
+    excel_files = glob.glob(f"{dataset_path}**/Grup_*.xlsx", recursive=True)
+    if not excel_files: return None, [], "Dataset klasöründe Excel dosyası bulunamadı."
+
+    results = []
+    skipped_files = []  # Atlanan dosyaları takip etmek için
+
+    for excel_file in excel_files:
+        df = pd.read_excel(excel_file)
+        base_dir = os.path.dirname(excel_file)
+
+        # Sütun isimlerini akıllı arama (Büyük/küçük harf veya boşluk hatalarını yoksayar)
+        file_col = next((col for col in df.columns if 'dosya' in str(col).lower()), None)
+        gender_col = next((col for col in df.columns if 'cinsiyet' in str(col).lower()), None)
+
+        if not file_col or not gender_col:
+            st.error(f"{excel_file} dosyasında 'Dosya' veya 'Cinsiyet' kelimesi geçen sütun bulunamadı!")
+            continue
+
+        for index, row in df.iterrows():
+            file_name = str(row[file_col]).strip()
+            if file_name.lower() == 'nan' or not file_name:
+                continue
+
+            # Akıllı Cinsiyet Okuyucu (E, Erkek, ERKEK, K, Kadın hepsini tanır)
+            raw_gender = str(row[gender_col]).strip().upper()
+            if raw_gender.startswith('E'):
+                true_label = 'Erkek'
+            elif raw_gender.startswith('K'):
+                true_label = 'Kadın'
+            elif raw_gender.startswith('C') or raw_gender.startswith('Ç'):
+                true_label = 'Çocuk'
+            else:
+                true_label = 'Bilinmiyor'
+
+            # Klasör yolu birleştirme
+            file_path = file_name
+            if not os.path.exists(file_path):
+                file_path = os.path.join(base_dir, file_name)
+
+            if not os.path.exists(file_path):
+                skipped_files.append({"Dosya": file_name, "Sebep": "Klasörde böyle bir .wav dosyası yok"})
+                continue
+
+            extracted_data, status_msg = extract_features(file_path)
+
+            if extracted_data:
+                features, _, _ = extracted_data
+                f0 = features['Ortalama_F0']
+                pred_label = classify_gender(f0)
+
+                results.append({
+                    'Dosya': file_name,
+                    'Gercek_Sinif': true_label,
+                    'Tahmin_Sinif': pred_label,
+                    'F0': f0,
+                    'Dogru_Mu': 1 if true_label == pred_label else 0
+                })
+            else:
+                skipped_files.append({"Dosya": file_name, "Sebep": status_msg})
+
+    df_results = pd.DataFrame(results)
+    return df_results, skipped_files, "Analiz süreci tamamlandı."
+
+
+# ==========================================
+# FAZ 3 - MAKİNE ÖĞRENMESİ DUYGU SINIFLANDIRICI
+# (MFCC/Delta + StandardScaler + SVM + GridSearchCV)
+# ==========================================
+
+EMOTION_LABELS = ['Nötr', 'Mutlu', 'Öfkeli', 'Üzgün', 'Şaşkın']
+
+# Türkçe özel karakterleri ASCII karşılıklarına dönüştürür
+_TR_MAP = str.maketrans('çğıöşüÇĞİÖŞÜ', 'cgiosuCGIOSU')
+
+def _normalize(text: str) -> str:
+    return text.translate(_TR_MAP).lower().strip()
+
+# Her etiket için normalize edilmiş anahtar kelimeler
+_LABEL_KEYS = {
+    _normalize(label): label for label in EMOTION_LABELS
+}
+# Ek kısaltma / alternatif yazımlar
+_ALIASES = {
+    'notr':   'Nötr',
+    'mutlu':  'Mutlu',
+    'ofkeli': 'Öfkeli',
+    'uzgun':  'Üzgün',
+    'saskin': 'Şaşkın',
+}
+_LABEL_KEYS.update(_ALIASES)
+
+
+def _match_emotion(raw: str):
+    """Ham duygu metnini 5 hedef sınıftan biriyle eşleştirir (Türkçe karakter toleranslı)."""
+    normalized = _normalize(raw)
+    for key, label in _LABEL_KEYS.items():
+        if key in normalized:
+            return label
+    return None
+
+
+def process_emotion_dataset(dataset_path="Dataset/"):
+    """
+    Excel dosyalarından duygu etiketli ses verilerini okur.
+    Excel sütunları: 'Dosya' (wav yolu) ve 'Duygu' (duygu etiketi).
+    """
+    excel_files = glob.glob(f"{dataset_path}**/Grup_*.xlsx", recursive=True)
+    if not excel_files:
+        return None, [], "Dataset klasöründe Excel dosyası bulunamadı."
+
+    feature_rows = []
+    skipped_files = []
+
+    def _extract_features_from_signal(audio, sr):
+        """Dosyaya yazmadan, bellekteki ses sinyalinden extract_features ile uyumlu öznitelik çıkarır."""
+        audio, _ = librosa.effects.trim(audio, top_db=20)
+        if len(audio) == 0:
+            return None, "Kırpma sonrası ses sinyali boş kaldı"
+
+        frame_length_ms = 30
+        frame_length = int(sr * (frame_length_ms / 1000.0))
+        hop_length = int(frame_length / 2)
+        if len(audio) < frame_length:
+            return None, "Ses çerçeveleme için çok kısa kaldı"
+
+        frames = librosa.util.frame(audio, frame_length=frame_length, hop_length=hop_length).T
+        energies = np.array([calculate_ste(f) for f in frames])
+        zcrs = np.array([calculate_zcr(f) for f in frames])
+
+        energy_threshold = np.mean(energies) * 0.2
+        zcr_threshold = np.mean(zcrs) * 2.5
+
+        f0_values = []
+        for i in range(len(frames)):
+            if energies[i] > energy_threshold and zcrs[i] < zcr_threshold:
+                f0 = compute_autocorrelation_pitch(frames[i], sr)
+                if 70 <= f0 <= 400:
+                    f0_values.append(f0)
+
+        if not f0_values:
+            top_frames_idx = np.argsort(energies)[-5:]
+            for idx in top_frames_idx:
+                f0 = compute_autocorrelation_pitch(frames[idx], sr)
+                if 70 <= f0 <= 400:
+                    f0_values.append(f0)
+
+        if not f0_values:
+            return None, "Sinyalde hiç insan sesi frekansı (70-400Hz) tespit edilemedi"
+
+        features = {
+            'Ortalama_F0': np.mean(f0_values),
+            'Ortalama_ZCR': np.mean(zcrs),
+            'Enerji_Ortalamasi': np.mean(energies)
+        }
+
+        mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+        delta_mfcc = librosa.feature.delta(mfcc)
+        delta2_mfcc = librosa.feature.delta(mfcc, order=2)
+
+        for matrix, prefix in (
+            (mfcc, 'MFCC'),
+            (delta_mfcc, 'Delta_MFCC'),
+            (delta2_mfcc, 'Delta2_MFCC'),
+        ):
+            for i in range(13):
+                coef = matrix[i]
+                features[f'{prefix}_{i + 1}_mean'] = float(np.mean(coef))
+                features[f'{prefix}_{i + 1}_std'] = float(np.std(coef))
+
+        return features, "OK"
+
+    for excel_file in excel_files:
+        df = pd.read_excel(excel_file)
+        base_dir = os.path.dirname(excel_file)
+
+        file_col = next((col for col in df.columns if 'dosya' in str(col).lower()), None)
+        emotion_col = next((col for col in df.columns if 'duygu' in str(col).lower() or 'emotion' in str(col).lower()), None)
+
+        if not file_col or not emotion_col:
+            continue  # Bu Excel'de duygu sütunu yok, atla
+
+        for _, row in df.iterrows():
+            file_name = str(row[file_col]).strip()
+            if file_name.lower() == 'nan' or not file_name:
+                continue
+
+            raw_emotion = str(row[emotion_col]).strip()
+            matched_label = _match_emotion(raw_emotion)
+            if matched_label is None:
+                skipped_files.append({"Dosya": file_name, "Sebep": f"Tanımsız duygu etiketi: '{raw_emotion}'"})
+                continue
+
+            file_path = file_name
+            if not os.path.exists(file_path):
+                file_path = os.path.join(base_dir, file_name)
+            if not os.path.exists(file_path):
+                skipped_files.append({"Dosya": file_name, "Sebep": "Dosya bulunamadı"})
+                continue
+
+            # 1) Orijinal örneği mevcut akışla ekle
+            extracted_data, status_msg = extract_features(file_path)
+            if extracted_data:
+                features, _, _ = extracted_data
+                row = dict(features)
+                row['Duygu'] = matched_label
+                feature_rows.append(row)
+            else:
+                skipped_files.append({"Dosya": file_name, "Sebep": status_msg})
+                continue
+
+            # 2) Aynı sesin beyaz gürültülü kopyasını üret ve yeni örnek olarak ekle
+            try:
+                y, sr = librosa.load(file_path, sr=None)
+                noise_amp = 0.005 * np.random.uniform() * np.amax(y)
+                y_noise = y + noise_amp * np.random.normal(size=y.shape[0])
+                aug_features, aug_msg = _extract_features_from_signal(y_noise, sr)
+                if aug_features is not None:
+                    aug_row = dict(aug_features)
+                    aug_row['Duygu'] = matched_label
+                    feature_rows.append(aug_row)
+                else:
+                    skipped_files.append({
+                        "Dosya": file_name,
+                        "Sebep": f"Augmentation başarısız: {aug_msg}"
+                    })
+            except Exception as e:
+                skipped_files.append({
+                    "Dosya": file_name,
+                    "Sebep": f"Augmentation hatası: {str(e)}"
+                })
+
+    if not feature_rows:
+        return None, skipped_files, "Hiç geçerli duygu verisi işlenemedi."
+
+    return pd.DataFrame(feature_rows), skipped_files, "Duygu veri seti okundu."
+
+
+def train_emotion_model(df_emotion):
+    """
+    Faz 3: GridSearchCV ile SVM hiperparametre optimizasyonu (cv=5),
+    ardından test setinde nihai doğruluk hesaplanır.
+    """
+    feature_cols = [c for c in df_emotion.columns if c != 'Duygu']
+
+    X = np.array(df_emotion[feature_cols].values, dtype=np.float64)
+    y = np.array(df_emotion['Duygu'].values, dtype=str)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', SVC(random_state=42)),
+    ])
+
+    param_grid = {
+        'clf__C': [0.1, 1, 10, 100],
+        'clf__kernel': ['rbf', 'linear'],
+        'clf__gamma': ['scale', 'auto', 0.01, 0.1],
+        'clf__class_weight': ['balanced', None],
+    }
+
+    grid_search = GridSearchCV(
+        pipeline,
+        param_grid,
+        cv=5,
+        scoring='accuracy',
+        n_jobs=-1,
+        refit=True,
+    )
+    grid_search.fit(X_train, y_train)
+
+    model = grid_search.best_estimator_
+    best_params = grid_search.best_params_
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+
+    print("\n" + "=" * 52)
+    print("  FAZ 3 – GridSearchCV SONUÇLARI (SVM, cv=5)")
+    print("=" * 52)
+    print(f"  Öznitelik sayısı     : {len(feature_cols)}")
+    print(f"  Eğitim seti boyutu  : {len(X_train)} örnek")
+    print(f"  Test seti boyutu    : {len(X_test)} örnek")
+    print(f"  En İyi Parametreler : {best_params}")
+    print(f"  CV En İyi Skor      : {grid_search.best_score_ * 100:.2f}%")
+    print(f"  Nihai Test Accuracy : {acc * 100:.2f}%")
+    print("=" * 52 + "\n")
+
+    return model, y_test, y_pred, acc, best_params, feature_cols
+
+
+def predict_emotion(features: dict, model, feature_cols):
+    """Tek bir ses örneğinden duygu tahmini (Pipeline: StandardScaler + SVM)."""
+    X = np.array([[features[col] for col in feature_cols]], dtype=np.float64)
+    return model.predict(X)[0]
+
+
+@st.cache_resource(show_spinner="Faz 3 duygu modeli yükleniyor (GridSearchCV)...")
+def load_emotion_classifier():
+    """Canlı Demo için veri setinden eğitilmiş en iyi modeli önbelleğe alır."""
+    df_emotion, _, msg = process_emotion_dataset()
+    if df_emotion is None or df_emotion.empty:
+        return None, None, msg
+    model, _, _, _, _, feature_cols = train_emotion_model(df_emotion)
+    return model, feature_cols, msg
+
+
+# ==========================================
+# 4. GÖRSELLEŞTİRME (OTOKORELASYON VS FFT)
+# ==========================================
+
+def plot_signals(frame, sr):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4))
+
+    autocorr = np.correlate(frame, frame, mode='full')
+    autocorr = autocorr[len(autocorr) // 2:]
+    lags = np.arange(len(autocorr))
+    time_lags = lags / sr
+
+    ax1.plot(time_lags[:int(sr / 50)], autocorr[:int(sr / 50)], color='darkblue')
+    ax1.set_title("Otokorelasyon (Zaman Düzlemi)")
+    ax1.set_xlabel("Gecikme (saniye)")
+    ax1.set_ylabel("Genlik")
+    ax1.grid(True)
+
+    n = len(frame)
+    fft_result = np.fft.fft(frame)
+    freqs = np.fft.fftfreq(n, 1 / sr)
+    pos_mask = (freqs > 0) & (freqs < 500)
+
+    ax2.plot(freqs[pos_mask], np.abs(fft_result)[pos_mask], color='crimson')
+    ax2.set_title("FFT Spektrumu (Frekans Düzlemi)")
+    ax2.set_xlabel("Frekans (Hz)")
+    ax2.set_ylabel("Büyüklük")
+    ax2.grid(True)
+    return fig
+
+
+# ==========================================
+# 5. STREAMLIT KULLANICI ARAYÜZÜ (UI)
+# ==========================================
+
+st.set_page_config(page_title="Cinsiyet Sınıflandırma", layout="wide")
+st.title("🎙️ Ses İşareti Analizi ve Kural Tabanlı Sınıflandırma")
+
+tab_demo, tab_dataset, tab_ml = st.tabs(["Canlı Demo", "Veri Seti Analizi ve Raporlama", "Faz 3 – ML Duygu Sınıflandırma"])
+
+with tab_demo:
+    uploaded_file = st.file_uploader("Analiz edilecek .wav dosyasını yükleyin", type=['wav'])
+    if uploaded_file is not None:
+        temp_path = "temp_audio.wav"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.audio(temp_path, format='audio/wav')
+
+        extracted_data, msg = extract_features(temp_path)
+        if extracted_data:
+            features, voiced_frames, sr = extracted_data
+            f0_val = features['Ortalama_F0']
+            prediction = classify_gender(f0_val)
+
+            c1, c2 = st.columns(2)
+            c1.metric("Tahmin Edilen Sınıf (Cinsiyet)", prediction)
+            c2.metric("Hesaplanan Ortalama F0", f"{f0_val:.2f} Hz")
+
+            emotion_model, feature_cols, model_msg = load_emotion_classifier()
+            if emotion_model is not None:
+                emotion_pred = predict_emotion(features, emotion_model, feature_cols)
+                st.markdown(
+                    f"<h2 style='text-align:center; color:#2E7D32;'>"
+                    f"Tahmin Edilen Duygu: {emotion_pred}</h2>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning(f"Duygu tahmini yapılamadı: {model_msg}")
+
+            mid_idx = len(voiced_frames) // 2
+            fig = plot_signals(voiced_frames[mid_idx], sr)
+            st.pyplot(fig)
+        else:
+            st.error(f"Analiz Başarısız: {msg}")
+
+        if os.path.exists(temp_path): os.remove(temp_path)
+
+with tab_dataset:
+    if st.button("Veri Setini Çalıştır ve Raporla", type="primary"):
+        df_results, skipped, message = process_entire_dataset()
+
+        # Hata Takip Ekranı (EĞER DOSYA OKUNAMADIYSA BURADA GÖZÜKECEK)
+        if skipped:
+            with st.expander(f"⚠️ Atlanan / İşlenemeyen Dosyalar ({len(skipped)} adet)", expanded=True):
+                st.warning(
+                    "Aşağıdaki dosyalar Excel'de var ancak analiz edilemedi. Sebeplerini tablodan inceleyebilirsiniz.")
+                st.dataframe(pd.DataFrame(skipped), use_container_width=True)
+
+        if df_results is not None and not df_results.empty:
+            st.success(f"{message} (Başarıyla işlenen dosya sayısı: {len(df_results)})")
+
+            stats = df_results.groupby('Gercek_Sinif').agg(
+                Örnek_Sayısı=('F0', 'count'),
+                Ortalama_F0=('F0', 'mean'),
+                Standart_Sapma=('F0', 'std'),
+                Basari_Yuzdesi=('Dogru_Mu', lambda x: (x.sum() / len(x)) * 100)
+            ).reset_index()
+
+            stats.columns = ['Sınıf', 'Örnek Sayısı', 'Ortalama F0 (Hz)', 'Standart Sapma', 'Başarı (%)']
+            stats['Ortalama F0 (Hz)'] = stats['Ortalama F0 (Hz)'].round(2)
+            stats['Standart Sapma'] = stats['Standart Sapma'].round(2)
+            stats['Başarı (%)'] = stats['Başarı (%)'].round(2).astype(str) + " %"
+
+            st.subheader("İstatistiksel Bulgular")
+            st.dataframe(stats, use_container_width=True)
+
+            st.subheader("Hata Analizi: Karışıklık Matrisi")
+            labels = ['Erkek', 'Kadın', 'Çocuk']
+            y_true = df_results['Gercek_Sinif'].tolist()
+            y_pred = df_results['Tahmin_Sinif'].tolist()
+            cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels, ax=ax)
+            ax.set_ylabel('Gerçek Sınıf')
+            ax.set_xlabel('Sistem Tahmini')
+            st.pyplot(fig)
+
+with tab_ml:
+    st.markdown("""
+    **Zaman Düzlemi:** F0, ZCR, Enerji (trim sonrası)  
+    **Frekans Düzlemi:** MFCC + Delta + Delta-Delta (≈ **81** öznitelik)  
+    **Ön İşleme:** StandardScaler  
+    **Algoritma:** SVM + **GridSearchCV** (`cv=5`, C / kernel / gamma taraması)  
+    **Hedef Sınıflar:** Nötr · Mutlu · Öfkeli · Üzgün · Şaşkın  
+    """)
+    st.info(
+        "Excel dosyalarınızda **'Dosya'** ve **'Duygu'** adlı sütunların bulunması gerekir. "
+        "'Duygu' sütunu; Nötr, Mutlu, Öfkeli, Üzgün veya Şaşkın değerlerinden birini içermelidir."
+    )
+
+    if st.button("Modeli Eğit ve Başarı Oranını Hesapla", type="primary"):
+        with st.spinner("Veri seti okunuyor; GridSearchCV ile hiperparametre aranıyor (birkaç dakika sürebilir)..."):
+            df_emotion, em_skipped, em_msg = process_emotion_dataset()
+
+        if em_skipped:
+            with st.expander(f"Atlanan Dosyalar ({len(em_skipped)} adet)"):
+                st.dataframe(pd.DataFrame(em_skipped), use_container_width=True)
+
+        if df_emotion is None or df_emotion.empty:
+            st.error(em_msg)
+        else:
+            st.success(f"{em_msg}  |  İşlenen örnek sayısı: {len(df_emotion)}")
+
+            # Sınıf dağılımı
+            dist = df_emotion['Duygu'].value_counts().reset_index()
+            dist.columns = ['Duygu', 'Örnek Sayısı']
+            st.dataframe(dist, use_container_width=True)
+
+            if len(df_emotion['Duygu'].unique()) < 2:
+                st.warning("Model eğitmek için en az 2 farklı duygu sınıfına ait veri gerekir.")
+            else:
+                model, y_test, y_pred, acc, best_params, _ = train_emotion_model(df_emotion)
+
+                st.metric(
+                    label="Nihai Test Accuracy (Score-Board)",
+                    value=f"{acc * 100:.2f}%"
+                )
+
+                st.subheader("GridSearchCV – En İyi Parametreler")
+                st.text_area(
+                    "Best Parameters",
+                    value="\n".join(f"{k}: {v}" for k, v in best_params.items()),
+                    height=120,
+                    disabled=True,
+                )
+
+                # Karışıklık matrisi
+                present_labels = sorted(df_emotion['Duygu'].unique())
+                cm = confusion_matrix(y_test, y_pred, labels=present_labels)
+                fig, ax = plt.subplots(figsize=(7, 5))
+                sns.heatmap(
+                    cm, annot=True, fmt='d', cmap='Greens',
+                    xticklabels=present_labels, yticklabels=present_labels, ax=ax
+                )
+                ax.set_ylabel('Gerçek Duygu')
+                ax.set_xlabel('Model Tahmini')
+                ax.set_title('Faz 3 – GridSearchCV SVM Karışıklık Matrisi')
+                st.pyplot(fig)
